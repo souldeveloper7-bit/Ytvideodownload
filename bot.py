@@ -285,11 +285,22 @@ async def run_download(app, uid, chat_id, status_id, url, kind, height):
                         }, {"key": "FFmpegMetadata"}],
                     })
                 else:
-                    if height:
-                        opts["format"] = f"best[height<={height}][filesize<={MAX_UPLOAD_BYTES}]/best[height<={height}]/best"
-                    else:
-                        opts["format"] = f"best[filesize<={MAX_UPLOAD_BYTES}]/best[height<=720]/best"
+                    # Prefer separate video + audio streams, then fall back to
+                    # a combined progressive file if the site does not expose
+                    # separate streams. Do not filter by filesize in the format
+                    # selector: YouTube often exposes streams without a known
+                    # filesize, which can make every format appear unavailable.
+                    quality = height or 720
+                    opts["format"] = (
+                        f"bestvideo[height<={quality}]+bestaudio/"
+                        f"best[height<={quality}]/best"
+                    )
                     opts["merge_output_format"] = "mp4"
+                    opts["format_sort"] = [
+                        f"res:{quality}",
+                        "ext:mp4:m4a",
+                        "codec:h264",
+                    ]
 
                 await asyncio.to_thread(lambda: yt_dlp.YoutubeDL(opts).download([url]))
                 files = [p for p in Path(tmp).iterdir() if p.is_file()]
