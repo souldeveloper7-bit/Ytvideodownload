@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import html
 import logging
 import os
@@ -49,6 +50,34 @@ def valid_url(value):
         return p.scheme in ("http", "https") and bool(p.netloc) and "." in p.netloc
     except Exception:
         return False
+
+def write_cookie_file(tmp_dir):
+    """
+    Load an optional Netscape-format cookies.txt from Railway's secret variable.
+    Never commit browser cookies to GitHub. Set YOUTUBE_COOKIES_B64 to the
+    base64-encoded contents of your own exported cookies.txt file.
+    """
+    encoded = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+    if not encoded:
+        return None
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+        # Netscape cookie files are text; reject obviously invalid payloads.
+        content = raw.decode("utf-8-sig")
+        if "Netscape" not in content[:500] and not content.lstrip().startswith("#"):
+            raise ValueError("Cookie file is not in Netscape cookies.txt format.")
+        cookie_path = Path(tmp_dir) / "youtube-cookies.txt"
+        cookie_path.write_text(content, encoding="utf-8")
+        try:
+            cookie_path.chmod(0o600)
+        except OSError:
+            pass
+        return str(cookie_path)
+    except Exception as exc:
+        raise RuntimeError(
+            "YOUTUBE_COOKIES_B64 is invalid. Export cookies in Netscape cookies.txt "
+            "format and store its base64 text in Railway Variables."
+        ) from exc
 
 def menu_keyboard():
     return InlineKeyboardMarkup([
@@ -172,9 +201,14 @@ async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = await update.effective_message.reply_text("🔎 Fetching media information…")
     def extract():
-        opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False)
+        opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
+                "remote_components": ["ejs:npm"]}
+        with tempfile.TemporaryDirectory(prefix="ytdlp_info_") as tmp:
+            cookie_file = write_cookie_file(tmp)
+            if cookie_file:
+                opts["cookiefile"] = cookie_file
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False)
     try:
         data = await asyncio.to_thread(extract)
         title = esc(data.get("title", "Unknown title"))
@@ -274,7 +308,14 @@ async def run_download(app, uid, chat_id, status_id, url, kind, height):
                     "socket_timeout": 25,
                     "retries": 2,
                     "fragment_retries": 2,
+                    # yt-dlp's EJS challenge solver is installed via yt-dlp[default]
+                    # and runs with Deno supplied by the Railway Docker image.
+                    "remote_components": ["ejs:npm"],
                 }
+                cookie_file = write_cookie_file(tmp)
+                if cookie_file:
+                    opts["cookiefile"] = cookie_file
+
                 if kind == "audio":
                     opts.update({
                         "format": "bestaudio/best",
@@ -291,8 +332,11 @@ async def run_download(app, uid, chat_id, status_id, url, kind, height):
                     # selector: YouTube often exposes streams without a known
                     # filesize, which can make every format appear unavailable.
                     quality = height or 720
+                    # Prefer separate video+audio streams, while allowing a
+                    # combined stream as a fallback. The * wildcard also
+                    # accepts formats that already contain audio.
                     opts["format"] = (
-                        f"bestvideo[height<={quality}]+bestaudio/"
+                        f"bestvideo*[height<={quality}]+bestaudio/"
                         f"best[height<={quality}]/best"
                     )
                     opts["merge_output_format"] = "mp4"
